@@ -5,10 +5,32 @@
 #include <array>
 #include <vector>
 #include <limits>
+#include <iterator>
 #include "helper_math.h"
 #include "mc_tables.h"
 #include "device_launch_parameters.h"
 
+texture<uint, 1, cudaReadModeElementType> edgeTex;
+texture<uint, 1, cudaReadModeElementType> triTex;
+texture<uint, 1, cudaReadModeElementType> numVertsTex;
+
+void allocateTextures(uint **d_edgeTable, uint **d_triTable,  uint **d_numVertsTable)
+{
+  cudaChannelFormatDesc channelDesc = 
+    cudaCreateChannelDesc(32, 0, 0, 0, cudaChannelFormatKindUnsigned);
+
+  cudaMalloc((void**) d_edgeTable, 256*sizeof(uint));
+  cudaMemcpy((void*)*d_edgeTable, (void *)edgeTable, 256*sizeof(uint), cudaMemcpyHostToDevice);
+  cudaBindTexture(0, edgeTex, *d_edgeTable, channelDesc);
+
+  cudaMalloc((void**) d_triTable, 256*16*sizeof(uint));
+  cudaMemcpy((void*)*d_triTable, (void *)triTable, 256*16*sizeof(uint), cudaMemcpyHostToDevice);
+  cudaBindTexture(0, triTex, *d_triTable, channelDesc);
+
+  cudaMalloc((void**) d_numVertsTable, 256*sizeof(uint));
+  cudaMemcpy((void*)*d_numVertsTable,(void*)numVertsTable,256*sizeof(uint),cudaMemcpyHostToDevice);
+  cudaBindTexture(0, numVertsTex, *d_numVertsTable, channelDesc);
+}
 
 cudaTextureObject_t createTexture1D(cudaArray *array)
 {
@@ -57,18 +79,19 @@ cudaTextureObject_t createTexture3D(cudaArray *array)
   return texObj;
 }
 
-cudaArray *copyToCudaArray(const std::vector<float> &data)
+template <typename T>
+cudaArray *copyToCudaArray(const std::vector<T> &data)
 {
   const int width = data.size();
   
   // Allocate CUDA array in device memory
-  cudaChannelFormatDesc channelDesc = cudaCreateChannelDesc<float>();
+  cudaChannelFormatDesc channelDesc = cudaCreateChannelDesc<T>();
   cudaArray *cuArray;
   cudaMallocArray(&cuArray, &channelDesc, width);
 
   // Copy to device memory some data located at address h_data
   // in host memory
-  cudaMemcpyToArray(cuArray, 0, 0, data.data(), width*sizeof(float),
+  cudaMemcpyToArray(cuArray, 0, 0, data.data(), width*sizeof(T),
 		    cudaMemcpyHostToDevice);
 
   return cuArray;
@@ -210,25 +233,46 @@ void computeCellGradients(float4 *cellGradients, dim3 roiSize,
 // 0-----1/  -->
 
 __device__
-float calcLstar(float f_c, float f_nodes[NUMELEMENTS][NUMTHREADS], float3 cellSize)
+float calcLstar(float f_c, float f_nodes[NUMELEMENTS][NUMTHREADS], 
+		float3 cellSize, float minVal, float maxVal)
 {
   int lidx = threadIdx.x + threadIdx.y*blockDim.x + threadIdx.z*blockDim.x*blockDim.y;
   float l = 0.0f;
 
   float isoValue = f_c;
-  
-  uint cubeindex;
-  cubeindex =  uint(f_nodes[0][lidx] < isoValue);
-  cubeindex += uint(f_nodes[1][lidx] < isoValue)*2;
-  cubeindex += uint(f_nodes[2][lidx] < isoValue)*4;
-  cubeindex += uint(f_nodes[3][lidx] < isoValue)*8;
-  cubeindex += uint(f_nodes[4][lidx] < isoValue)*16;
-  cubeindex += uint(f_nodes[5][lidx] < isoValue)*32;
-  cubeindex += uint(f_nodes[6][lidx] < isoValue)*64;
-  cubeindex += uint(f_nodes[7][lidx] < isoValue)*128;
+  int iter = 0;
+  while (iter < 10) {
 
-  //  uint numVerts = tex1Dfetch(numVertsTex, cubeindex);
+    uint cubeindex;
+    cubeindex =  uint(f_nodes[0][lidx] < isoValue);
+    cubeindex += uint(f_nodes[1][lidx] < isoValue)*2;
+    cubeindex += uint(f_nodes[2][lidx] < isoValue)*4;
+    cubeindex += uint(f_nodes[3][lidx] < isoValue)*8;
+    cubeindex += uint(f_nodes[4][lidx] < isoValue)*16;
+    cubeindex += uint(f_nodes[5][lidx] < isoValue)*32;
+    cubeindex += uint(f_nodes[6][lidx] < isoValue)*64;
+    cubeindex += uint(f_nodes[7][lidx] < isoValue)*128;
 
+    uint numVerts = tex1Dfetch(numVertsTex, cubeindex);
+
+    for (int i = 0; i < numVerts; i+=3) {
+
+      float3 v[3];
+
+      uint edge;
+      edge = tex1Dfetch(triTex, (cubeindex*16) + i);
+      // v[0] = vertlist[(edge*NTHREADS)+threadIdx.x];
+    }
+
+    float volume = 0.0f;//fabs(ComputeVolume(tmpPoly));
+    if (volume < f_c)
+      maxVal = isoValue;
+    else
+      minVal = isoValue;
+    isoValue = (maxVal+minVal)/2.0f;
+    
+    iter++;
+  }
   return l;
 }
 
@@ -260,25 +304,52 @@ void computeLStar(float *lstar, dim3 roiOffset, dim3 roiSize,
 				  tex1D<float>(dzTex,fk+roiOffset.z));  
     float3 halfCellSize = cellSize/2.0f;  
     float3 dx;
-    
+    float minVal = 100000.0f, maxVal = -100000.0f;
+
     dx = make_float3(-halfCellSize.x,-halfCellSize.y,-halfCellSize.z);
     f_nodes[0][lidx] = f + dot(dx,gf);
+    if (minVal > f_nodes[0][lidx]) minVal = f_nodes[0][lidx];
+    if (maxVal < f_nodes[0][lidx]) maxVal = f_nodes[0][lidx];
+
     dx = make_float3( halfCellSize.x,-halfCellSize.y,-halfCellSize.z);
     f_nodes[1][lidx] = f + dot(dx,gf);
+    if (minVal > f_nodes[1][lidx]) minVal = f_nodes[1][lidx];
+    if (maxVal < f_nodes[1][lidx]) maxVal = f_nodes[1][lidx];
+
     dx = make_float3( halfCellSize.x, halfCellSize.y,-halfCellSize.z);
     f_nodes[2][lidx] = f + dot(dx,gf);
+    if (minVal > f_nodes[2][lidx]) minVal = f_nodes[2][lidx];
+    if (maxVal < f_nodes[2][lidx]) maxVal = f_nodes[2][lidx];
+
     dx = make_float3(-halfCellSize.x, halfCellSize.y,-halfCellSize.z);
     f_nodes[3][lidx] = f + dot(dx,gf);
+    if (minVal > f_nodes[3][lidx]) minVal = f_nodes[3][lidx];
+    if (maxVal < f_nodes[3][lidx]) maxVal = f_nodes[3][lidx];
+
     dx = make_float3(-halfCellSize.x,-halfCellSize.y, halfCellSize.z);
     f_nodes[4][lidx] = f + dot(dx,gf);
+    if (minVal > f_nodes[4][lidx]) minVal = f_nodes[4][lidx];
+    if (maxVal < f_nodes[4][lidx]) maxVal = f_nodes[4][lidx];
+
     dx = make_float3( halfCellSize.x,-halfCellSize.y, halfCellSize.z);
     f_nodes[5][lidx] = f + dot(dx,gf);
+    if (minVal > f_nodes[5][lidx]) minVal = f_nodes[5][lidx];
+    if (maxVal < f_nodes[5][lidx]) maxVal = f_nodes[5][lidx];
+
     dx = make_float3( halfCellSize.x, halfCellSize.y, halfCellSize.z);
     f_nodes[6][lidx] = f + dot(dx,gf);
+    if (minVal > f_nodes[6][lidx]) minVal = f_nodes[6][lidx];
+    if (maxVal < f_nodes[6][lidx]) maxVal = f_nodes[6][lidx];
+
     dx = make_float3(-halfCellSize.x, halfCellSize.y, halfCellSize.z);
     f_nodes[7][lidx] = f + dot(dx,gf);
+    if (minVal > f_nodes[7][lidx]) minVal = f_nodes[7][lidx];
+    if (maxVal < f_nodes[7][lidx]) maxVal = f_nodes[7][lidx];
 
-    float l = calcLstar(f, f_nodes, cellSize);
+    float l = calcLstar(f, f_nodes, cellSize, minVal, maxVal);
+
+    int idx = i + j*roiSize.x + k*roiSize.x*roiSize.y;
+    lstar[idx] = l;
   }
 }
 
@@ -340,35 +411,45 @@ void extractPLIC(const std::vector<float> &vof,
   computeCellGradients<<<numBlocks, numThreads>>>(d_cellGradients, roiSize, nodeGradientsTex);
 
   cudaArray *da_cellGradients = copyToCudaArray3D<float4>(d_cellGradients, 
-							  dim3(roiSize.x, roiSize.y,roiSize.y),
-							  cudaMemcpyDeviceToDevice);
+  							  dim3(roiSize.x, roiSize.y,roiSize.y),
+  							  cudaMemcpyDeviceToDevice);
   cudaTextureObject_t cellGradientsTex = createTexture3D(da_cellGradients);
+
+  // allocate textures
+  uint *d_edgeTable;
+  uint *d_triTable;
+  uint *d_numVertsTable;
+  allocateTextures(&d_edgeTable, &d_triTable, &d_numVertsTable);
 
   float *d_lstar;
   cudaMalloc(&d_lstar, numCells*sizeof(float));  
   computeLStar<<<numBlocks, numThreads>>>(d_lstar,roiOffset,roiSize,
-  					  cellGradientsTex,vofTex,
-					  dxTex[0], dxTex[1], dxTex[2]);
+  					  cellGradientsTex, vofTex,
+  					  dxTex[0], dxTex[1], dxTex[2]);
   // extract plic
 
   // test
-  float4 *h_cellNormals = new float4[numCells];
-  cudaMemcpy(h_cellNormals, d_cellGradients, numCells*sizeof(float4), cudaMemcpyDeviceToHost);
+  float *h_lstar = new float[numCells];
+  cudaMemcpy(h_lstar, d_lstar, numCells*sizeof(float), cudaMemcpyDeviceToHost);
 
   int idx = 0;
   for (int k = 0; k < roiSize.z; ++k) {
     for (int j = 0; j < roiSize.y; ++j) {
       for (int i = 0; i < roiSize.x; ++i) {
-	if (length(make_float3(h_cellNormals[idx])) > 0) {
+	if (h_lstar[idx] > 0) {
 	  vertices.push_back(make_float4(i,j,k,1.0f));
-	  normals.push_back(h_cellNormals[idx]);
+	  normals.push_back(make_float4(h_lstar[idx]));
 	}
 	++idx;
       }
     }
   }
-  delete [] h_cellNormals;
+  delete [] h_lstar;
   // test end
+
+  cudaFree(d_edgeTable);
+  cudaFree(d_triTable);
+  cudaFree(d_numVertsTable);
 
   cudaFree(d_lstar);
   cudaFree(d_cellGradients);
