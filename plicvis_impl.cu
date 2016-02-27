@@ -198,6 +198,90 @@ void computeCellGradients(float4 *cellGradients, dim3 roiSize,
   }
 }
 
+#define NUMTHREADS 64
+#define NUMELEMENTS 8
+
+// ^          ^
+// |         /
+//  /7-----6
+// 3-----2 |
+// |  |  | |
+// | /4--|-5
+// 0-----1/  -->
+
+__device__
+float calcLstar(float f_c, float f_nodes[NUMELEMENTS][NUMTHREADS], float3 cellSize)
+{
+  int lidx = threadIdx.x + threadIdx.y*blockDim.x + threadIdx.z*blockDim.x*blockDim.y;
+  float l = 0.0f;
+
+  float isoValue = f_c;
+  
+  uint cubeindex;
+  cubeindex =  uint(f_nodes[0][lidx] < isoValue);
+  cubeindex += uint(f_nodes[1][lidx] < isoValue)*2;
+  cubeindex += uint(f_nodes[2][lidx] < isoValue)*4;
+  cubeindex += uint(f_nodes[3][lidx] < isoValue)*8;
+  cubeindex += uint(f_nodes[4][lidx] < isoValue)*16;
+  cubeindex += uint(f_nodes[5][lidx] < isoValue)*32;
+  cubeindex += uint(f_nodes[6][lidx] < isoValue)*64;
+  cubeindex += uint(f_nodes[7][lidx] < isoValue)*128;
+
+  //  uint numVerts = tex1Dfetch(numVertsTex, cubeindex);
+
+  return l;
+}
+
+__global__
+void computeLStar(float *lstar, dim3 roiOffset, dim3 roiSize,
+		  cudaTextureObject_t cellGradientsTex,
+		  cudaTextureObject_t vofTex,
+		  cudaTextureObject_t dxTex,
+		  cudaTextureObject_t dyTex,
+		  cudaTextureObject_t dzTex)
+{
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  int j = blockIdx.y * blockDim.y + threadIdx.y;
+  int k = blockIdx.z * blockDim.z + threadIdx.z;
+  int lidx = threadIdx.x + threadIdx.y*blockDim.x + threadIdx.z*blockDim.x*blockDim.y;
+
+  __shared__ float f_nodes[NUMELEMENTS][NUMTHREADS];
+  
+  if (!(i >= roiSize.x ||
+	j >= roiSize.y ||
+	k >= roiSize.z)) {
+ 
+    float fi = i+0.5f, fj = j+0.5f, fk = k+0.5f;
+    // with taylor expansion evaluate f values on nodes
+    float f = tex3D<float>(vofTex, fi+roiOffset.x, fj+roiOffset.y, fk+roiOffset.z);
+    float3 gf = make_float3(tex3D<float4>(cellGradientsTex, fi, fj, fk));
+    float3 cellSize = make_float3(tex1D<float>(dxTex,fi+roiOffset.x),
+				  tex1D<float>(dyTex,fj+roiOffset.y),
+				  tex1D<float>(dzTex,fk+roiOffset.z));  
+    float3 halfCellSize = cellSize/2.0f;  
+    float3 dx;
+    
+    dx = make_float3(-halfCellSize.x,-halfCellSize.y,-halfCellSize.z);
+    f_nodes[0][lidx] = f + dot(dx,gf);
+    dx = make_float3( halfCellSize.x,-halfCellSize.y,-halfCellSize.z);
+    f_nodes[1][lidx] = f + dot(dx,gf);
+    dx = make_float3( halfCellSize.x, halfCellSize.y,-halfCellSize.z);
+    f_nodes[2][lidx] = f + dot(dx,gf);
+    dx = make_float3(-halfCellSize.x, halfCellSize.y,-halfCellSize.z);
+    f_nodes[3][lidx] = f + dot(dx,gf);
+    dx = make_float3(-halfCellSize.x,-halfCellSize.y, halfCellSize.z);
+    f_nodes[4][lidx] = f + dot(dx,gf);
+    dx = make_float3( halfCellSize.x,-halfCellSize.y, halfCellSize.z);
+    f_nodes[5][lidx] = f + dot(dx,gf);
+    dx = make_float3( halfCellSize.x, halfCellSize.y, halfCellSize.z);
+    f_nodes[6][lidx] = f + dot(dx,gf);
+    dx = make_float3(-halfCellSize.x, halfCellSize.y, halfCellSize.z);
+    f_nodes[7][lidx] = f + dot(dx,gf);
+
+    float l = calcLstar(f, f_nodes, cellSize);
+  }
+}
+
 inline int divUp(int a, int b)
 {
   return a/b + (a%b == 0 ? 0 : 1);
@@ -255,8 +339,16 @@ void extractPLIC(const std::vector<float> &vof,
 
   computeCellGradients<<<numBlocks, numThreads>>>(d_cellGradients, roiSize, nodeGradientsTex);
 
+  cudaArray *da_cellGradients = copyToCudaArray3D<float4>(d_cellGradients, 
+							  dim3(roiSize.x, roiSize.y,roiSize.y),
+							  cudaMemcpyDeviceToDevice);
+  cudaTextureObject_t cellGradientsTex = createTexture3D(da_cellGradients);
 
-  // compute lstar
+  float *d_lstar;
+  cudaMalloc(&d_lstar, numCells*sizeof(float));  
+  computeLStar<<<numBlocks, numThreads>>>(d_lstar,roiOffset,roiSize,
+  					  cellGradientsTex,vofTex,
+					  dxTex[0], dxTex[1], dxTex[2]);
   // extract plic
 
   // test
@@ -278,33 +370,21 @@ void extractPLIC(const std::vector<float> &vof,
   delete [] h_cellNormals;
   // test end
 
+  cudaFree(d_lstar);
   cudaFree(d_cellGradients);
   cudaFree(d_nodeGradients);
 
+  cudaDestroyTextureObject(cellGradientsTex);
   cudaDestroyTextureObject(nodeGradientsTex);
   cudaDestroyTextureObject(vofTex);
   cudaDestroyTextureObject(dxTex[0]);
   cudaDestroyTextureObject(dxTex[1]);
   cudaDestroyTextureObject(dxTex[2]);
-  
+
+  cudaFreeArray(da_cellGradients);
   cudaFreeArray(da_nodeGradients);
   cudaFreeArray(da_vof);
   cudaFreeArray(da_dx[0]);
   cudaFreeArray(da_dx[1]);
   cudaFreeArray(da_dx[2]);
-
-  vertices.push_back(make_float4(0,0,0,1));
-  vertices.push_back(make_float4(1,0,0,1));
-  vertices.push_back(make_float4(0,1,0,1));
-  vertices.push_back(make_float4(1,1,0,1));
-  indices.push_back(0);
-  indices.push_back(1);
-  indices.push_back(2);
-  indices.push_back(1);
-  indices.push_back(3);
-  indices.push_back(2);
-  normals.push_back(make_float4(0,0,1,0));
-  normals.push_back(make_float4(0,0,1,0));
-  normals.push_back(make_float4(0,0,1,0));
-  normals.push_back(make_float4(0,0,1,0));
 }
