@@ -232,6 +232,17 @@ void computeCellGradients(float4 *cellGradients, dim3 roiSize,
 // | /4--|-5
 // 0-----1/  -->
 
+#define NUMEDGES 12
+__constant__ uint2 c_egdes[NUMEDGES];
+__constant__ uint2 c_egdesMask[NUMEDGES]; // used for masking
+
+__device__
+float3 vertexInterp(float isolevel, float3 p0, float3 p1, float f0, float f1)
+{
+    float t = (isolevel - f0) / (f1 - f0);
+    return lerp(p0, p1, t);
+}
+
 __device__
 float calcLstar(float f_c, float f_nodes[NUMELEMENTS][NUMTHREADS], 
 		float3 cellSize, float minVal, float maxVal)
@@ -243,28 +254,66 @@ float calcLstar(float f_c, float f_nodes[NUMELEMENTS][NUMTHREADS],
   int iter = 0;
   while (iter < 10) {
 
-    uint cubeindex;
-    cubeindex =  uint(f_nodes[0][lidx] < isoValue);
-    cubeindex += uint(f_nodes[1][lidx] < isoValue)*2;
-    cubeindex += uint(f_nodes[2][lidx] < isoValue)*4;
-    cubeindex += uint(f_nodes[3][lidx] < isoValue)*8;
-    cubeindex += uint(f_nodes[4][lidx] < isoValue)*16;
-    cubeindex += uint(f_nodes[5][lidx] < isoValue)*32;
-    cubeindex += uint(f_nodes[6][lidx] < isoValue)*64;
-    cubeindex += uint(f_nodes[7][lidx] < isoValue)*128;
+    float volume = 0.0f;
+    
+    {// this must be done for all 27 cells...
+      uint cubeindex;
+      cubeindex =  uint(f_nodes[0][lidx] < isoValue);
+      cubeindex += uint(f_nodes[1][lidx] < isoValue)*2;
+      cubeindex += uint(f_nodes[2][lidx] < isoValue)*4;
+      cubeindex += uint(f_nodes[3][lidx] < isoValue)*8;
+      cubeindex += uint(f_nodes[4][lidx] < isoValue)*16;
+      cubeindex += uint(f_nodes[5][lidx] < isoValue)*32;
+      cubeindex += uint(f_nodes[6][lidx] < isoValue)*64;
+      cubeindex += uint(f_nodes[7][lidx] < isoValue)*128;
 
-    uint numVerts = tex1Dfetch(numVertsTex, cubeindex);
+      uint numVerts = tex1Dfetch(numVertsTex, cubeindex);
+    
+      for (int i = 0; i < numVerts; i+=3) {
 
-    for (int i = 0; i < numVerts; i+=3) {
+	float3 v0,v1,v2;
 
-      float3 v[3];
+	uint edge;
+	edge = tex1Dfetch(triTex, (cubeindex*16) + i);
+	float3 p0 = make_float3((c_egdesMask[edge].x & 1) * cellSize.x,
+				(c_egdesMask[edge].x & 2) * cellSize.y,
+				(c_egdesMask[edge].x & 4) * cellSize.z);      
+	float3 p1 = make_float3((c_egdesMask[edge].y & 1) * cellSize.x,
+				(c_egdesMask[edge].y & 2) * cellSize.y,
+				(c_egdesMask[edge].y & 4) * cellSize.z);
+      
+	v0 = vertexInterp(isoValue, p0, p1,
+			  f_nodes[c_egdes[edge].x][lidx],
+			  f_nodes[c_egdes[edge].y][lidx]);
 
-      uint edge;
-      edge = tex1Dfetch(triTex, (cubeindex*16) + i);
-      // v[0] = vertlist[(edge*NTHREADS)+threadIdx.x];
+	edge = tex1Dfetch(triTex, (cubeindex*16) + i + 1);
+	p0 = make_float3((c_egdesMask[edge].x & 1) * cellSize.x,
+			 (c_egdesMask[edge].x & 2) * cellSize.y,
+			 (c_egdesMask[edge].x & 4) * cellSize.z);      
+	p1 = make_float3((c_egdesMask[edge].y & 1) * cellSize.x,
+			 (c_egdesMask[edge].y & 2) * cellSize.y,
+			 (c_egdesMask[edge].y & 4) * cellSize.z);
+      
+	v1 = vertexInterp(isoValue, p0, p1,
+			  f_nodes[c_egdes[edge].x][lidx],
+			  f_nodes[c_egdes[edge].y][lidx]);
+
+	edge = tex1Dfetch(triTex, (cubeindex*16) + i + 2);
+	p0 = make_float3((c_egdesMask[edge].x & 1) * cellSize.x,
+			 (c_egdesMask[edge].x & 2) * cellSize.y,
+			 (c_egdesMask[edge].x & 4) * cellSize.z);      
+	p1 = make_float3((c_egdesMask[edge].y & 1) * cellSize.x,
+			 (c_egdesMask[edge].y & 2) * cellSize.y,
+			 (c_egdesMask[edge].y & 4) * cellSize.z);
+      
+	v2 = vertexInterp(isoValue, p0, p1,
+			  f_nodes[c_egdes[edge].x][lidx],
+			  f_nodes[c_egdes[edge].y][lidx]);
+
+	volume += dot(cross(v1-v0,v2-v0),v0)/6.0f;
+      }
     }
-
-    float volume = 0.0f;//fabs(ComputeVolume(tmpPoly));
+    
     if (volume < f_c)
       maxVal = isoValue;
     else
@@ -273,7 +322,7 @@ float calcLstar(float f_c, float f_nodes[NUMELEMENTS][NUMTHREADS],
     
     iter++;
   }
-  return l;
+  return isoValue;
 }
 
 __global__
@@ -366,6 +415,16 @@ void extractPLIC(const std::vector<float> &vof,
 		 std::vector<int> &indices, 
 		 std::vector<float4> &normals)
 {
+  uint2 h_edges[NUMEDGES] = {{0,1},{1,2},{2,3},{3,0},
+			     {4,5},{5,6},{6,7},{7,4},
+			     {0,4},{1,5},{2,6},{3,7}};
+  cudaMemcpyToSymbol(c_egdes, h_edges, sizeof(uint2)*NUMEDGES);
+
+  uint2 h_edgesMask[NUMEDGES] = {{0,1},{1,3},{3,2},{2,0},
+				 {4,5},{5,7},{7,6},{6,4},
+				 {0,4},{1,5},{3,7},{2,6}};
+  cudaMemcpyToSymbol(c_egdesMask, h_edgesMask, sizeof(uint2)*NUMEDGES);
+
   cudaArray *da_dx[3] = {copyToCudaArray(dx[0]),
 			 copyToCudaArray(dx[1]),
 			 copyToCudaArray(dx[2])};
