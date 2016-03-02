@@ -224,6 +224,8 @@ void computeCellGradients(float4 *cellGradients, dim3 roiSize,
 #define NUMTHREADS 64
 #define NUMELEMENTS 8
 
+#define NUMEDGES 12
+
 // ^          ^
 // |         /
 //  /7-----6
@@ -232,8 +234,16 @@ void computeCellGradients(float4 *cellGradients, dim3 roiSize,
 // | /4--|-5
 // 0-----1/  -->
 
-#define NUMEDGES 12
 __constant__ uint2 c_egdes[NUMEDGES];
+
+// ^          ^
+// |         /
+//  /6-----7
+// 2-----3 |
+// |  |  | |
+// | /4--|-5
+// 0-----1/  -->
+
 __constant__ uint2 c_egdesMask[NUMEDGES]; // used for masking
 
 __device__
